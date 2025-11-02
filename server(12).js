@@ -2,7 +2,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
-const { MongoClient, ServerApiVersion } = require("mongodb"); // Import MongoDB client
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb"); // Import ObjectId
 
 // --- START: MongoDB Setup ---
 // IMPORTANT: Use Environment Variable in Production (See Step 4 later)
@@ -23,37 +23,46 @@ const mongoClient = new MongoClient(mongoUri, {
   }
 });
 
-let db; // To hold the database connection
-let idsCollection; // To hold the collection reference
+let db;
+let idsCollection; 
+let offlineMessagesCollection; // For 1-on-1 messages
+// --- NEW FOR GROUPS ---
+let groupsCollection;
+let groupOfflineMessagesCollection;
+// --- END NEW ---
 
 async function connectToMongo() {
   try {
     await mongoClient.connect();
-    db = mongoClient.db("syrjaAppDb"); // Choose a database name
-    idsCollection = db.collection("syrjaIds"); // Choose a collection name
-
-    // --- TTL Index for Temporary IDs ---
+    db = mongoClient.db("syrjaAppDb");
+    
+    // --- 1. Syrja IDs Collection ---
+    idsCollection = db.collection("syrjaIds");
     await idsCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
     
-    // --- NEW: Setup for Offline Messages ---
+    // --- 2. 1-on-1 Offline Messages Collection ---
     offlineMessagesCollection = db.collection("offlineMessages");
-
-    // 1. TTL Index for 14-day expiry (on 'expireAt' field)
     await offlineMessagesCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
-
-    // 2. Index for finding messages FOR a recipient
     await offlineMessagesCollection.createIndex({ recipientPubKey: 1 });
-
-    // 3. Index for calculating a sender's quota usage
     await offlineMessagesCollection.createIndex({ senderPubKey: 1 });
 
-    console.log("✅ Offline messages collection and indexes are ready.");
-    // --- END NEW ---
+    // --- 3. NEW: Groups Collection ---
+    groupsCollection = db.collection("groups");
+    await groupsCollection.createIndex({ adminPubKey: 1 });
+    await groupsCollection.createIndex({ "members.pubKey": 1 }); // Index the pubKey within the members array
 
-    console.log("✅ Connected successfully to MongoDB Atlas");
+    // --- 4. NEW: Group Offline Messages Collection ---
+    // This stores messages for offline group members
+    groupOfflineMessagesCollection = db.collection("groupOfflineMessages");
+    await groupOfflineMessagesCollection.createIndex({ "expireAt": 1 }, { expireAfterSeconds: 0 });
+    await groupOfflineMessagesCollection.createIndex({ recipientPubKey: 1 });
+    await groupOfflineMessagesCollection.createIndex({ senderPubKey: 1 });
+    await groupOfflineMessagesCollection.createIndex({ groupId: 1 });
+    
+    console.log("✅ Connected successfully to MongoDB Atlas (All collections ready)");
   } catch (err) {
     console.error("❌ Failed to connect to MongoDB Atlas", err);
-    process.exit(1); // Exit if DB connection fails on startup
+    process.exit(1);
   }
 }
 // --- END: MongoDB Setup ---
@@ -383,63 +392,66 @@ app.post("/unblock-user", async (req, res) => {
     }
 });
 
-// --- NEW: Endpoint to delete ALL relayed messages for a user ---
+// --- MODIFIED: Endpoint to delete ALL relayed messages for a user ---
 app.post("/delete-all-relayed-messages", async (req, res) => {
     const { pubKey } = req.body;
     if (!pubKey) {
-        return res.status(400).json({ error: "Public key is required for authentication." });
+        return res.status(400).json({ error: "Public key is required." });
     }
-
     try {
-        // Delete all relayed messages sent by this user
-        const msgDeleteResult = await offlineMessagesCollection.deleteMany({ senderPubKey: pubKey });
-
-        console.log(`🗑️ DELETED ALL RELAYED MESSAGES for ${pubKey.slice(0,10)}...`);
-        console.log(`   - Messages deleted: ${msgDeleteResult.deletedCount}`);
+        // --- MODIFIED: Delete from BOTH collections ---
+        const p2pDeleteResult = await offlineMessagesCollection.deleteMany({ senderPubKey: pubKey });
+        const groupDeleteResult = await groupOfflineMessagesCollection.deleteMany({ senderPubKey: pubKey });
         
-        res.json({ 
-            success: true, 
-            messagesDeleted: msgDeleteResult.deletedCount 
-        });
-
-    } catch (err) {
-        console.error("delete-all-relayed-messages error:", err);
-        res.status(500).json({ error: "Database operation failed during message deletion." });
-    }
+        const totalDeleted = p2pDeleteResult.deletedCount + groupDeleteResult.deletedCount;
+        console.log(`🗑️ DELETED ALL RELAYED MESSAGES for ${pubKey.slice(0,10)}...`);
+        console.log(`   - 1-on-1 messages deleted: ${p2pDeleteResult.deletedCount}`);
+        console.log(`   - Group messages deleted: ${groupDeleteResult.deletedCount}`);
+        
+        res.json({ success: true, messagesDeleted: totalDeleted });
+    } catch (err) { console.error("delete-all-relayed-messages error:", err); res.status(500).json({ error: "Database operation failed." }); }
 });
 
-// --- NEW: Endpoint to delete all user data from the server ---
+// --- MODIFIED: Endpoint to delete all user data from the server ---
 app.post("/discontinue-service", async (req, res) => {
     const { pubKey } = req.body;
     if (!pubKey) {
-        return res.status(400).json({ error: "Public key is required for authentication." });
+        return res.status(400).json({ error: "Public key is required." });
     }
-
     try {
-        // 1. Delete the user's Syrja ID
+        // 1. Delete Syrja ID
         const idDeleteResult = await idsCollection.deleteOne({ pubKey: pubKey });
         
-        // 2. Delete all relayed messages sent by this user
-        const msgDeleteResult = await offlineMessagesCollection.deleteMany({ senderPubKey: pubKey });
+        // 2. Delete all relayed messages (1-on-1 and Group)
+        const p2pDeleteResult = await offlineMessagesCollection.deleteMany({ senderPubKey: pubKey });
+        const groupDeleteResult = await groupOfflineMessagesCollection.deleteMany({ senderPubKey: pubKey });
+        const totalDeleted = p2pDeleteResult.deletedCount + groupDeleteResult.deletedCount;
 
+        // 3. NEW: Remove user from all groups
+        const groupUpdateResult = await groupsCollection.updateMany(
+            { "members.pubKey": pubKey },
+            { $pull: { members: { pubKey: pubKey } } }
+        );
+        // (Note: This doesn't delete groups where they were the admin, just removes them)
+        
         console.log(`🗑️ DISCONTINUE SERVICE for ${pubKey.slice(0,10)}...`);
         console.log(`   - Syrja ID deleted: ${idDeleteResult.deletedCount}`);
-        console.log(`   - Relayed messages deleted: ${msgDeleteResult.deletedCount}`);
+        console.log(`   - Relayed messages deleted: ${totalDeleted}`);
+        console.log(`   - Removed from groups: ${groupUpdateResult.modifiedCount}`);
         
         res.json({ 
             success: true, 
             idDeleted: idDeleteResult.deletedCount, 
-            messagesDeleted: msgDeleteResult.deletedCount 
+            messagesDeleted: totalDeleted,
+            groupsLeft: groupUpdateResult.modifiedCount
         });
-
-    } catch (err) {
-        console.error("discontinue-service error:", err);
-        res.status(500).json({ error: "Database operation failed during data deletion." });
-    }
+    } catch (err) { console.error("discontinue-service error:", err); res.status(500).json({ error: "Database operation failed." }); }
 });
 
 // --- START: Offline Message Relay Service ---
 const USER_QUOTA_BYTES = 1 * 1024 * 1024; // 1MB
+// --- NEW: Group Quota ---
+const GROUP_QUOTA_BYTES = 0.5 * 1024 * 1024; // 0.5MB (Per-user, for groups)
 
 app.post("/relay-message", async (req, res) => {
     const { senderPubKey, recipientPubKey, encryptedPayload } = req.body;
@@ -456,15 +468,21 @@ app.post("/relay-message", async (req, res) => {
         }
 
         // 2. Check user's current quota usage
-        const userMessages = await offlineMessagesCollection.find({ senderPubKey }).toArray();
-        let currentUsage = 0;
-        userMessages.forEach(msg => {
-            currentUsage += msg.sizeBytes || 0; // Use stored size
-        });
+        // --- MODIFIED: Check quota from BOTH collections ---
+        const userMessages1on1 = await offlineMessagesCollection.find({ senderPubKey }).toArray();
+        const userMessagesGroup = await groupOfflineMessagesCollection.find({ senderPubKey }).toArray(); // <-- NEW
 
-        if (currentUsage + payloadSizeBytes > USER_QUOTA_BYTES) {
-            return res.status(413).json({ error: `Quota exceeded. Current usage: ${currentUsage} bytes. This message: ${payloadSizeBytes} bytes. Limit: ${USER_QUOTA_BYTES} bytes.` });
+        let currentUsage1on1 = 0;
+        userMessages1on1.forEach(msg => { currentUsage1on1 += msg.sizeBytes || 0; });
+        
+        let currentUsageGroup = 0; // <-- NEW
+        userMessagesGroup.forEach(msg => { currentUsageGroup += msg.sizeBytes || 0; }); // <-- NEW
+
+        // This check is for the 1-on-1 quota
+        if (currentUsage1on1 + payloadSizeBytes > USER_QUOTA_BYTES) {
+            return res.status(413).json({ error: `1-on-1 quota exceeded. Current: ${currentUsage1on1} bytes. This: ${payloadSizeBytes} bytes. Limit: ${USER_QUOTA_BYTES} bytes.` });
         }
+        // --- END MODIFIED ---
 
         // 3. Store the message
         const messageDoc = {
@@ -488,23 +506,47 @@ app.post("/relay-message", async (req, res) => {
 });
 
 // Endpoint for sender to view their relayed messages and quota
+// Endpoint for sender to view their relayed messages and quota
 app.get("/my-relayed-messages/:senderPubKey", async (req, res) => {
     const { senderPubKey } = req.params;
     if (!senderPubKey) return res.status(400).json({ error: "Missing sender public key." });
 
     try {
-        const messages = await offlineMessagesCollection.find(
+        // --- MODIFIED: Get messages from BOTH collections ---
+        const messages1on1 = await offlineMessagesCollection.find(
             { senderPubKey },
-            { projection: { _id: 1, recipientPubKey: 1, sizeBytes: 1, createdAt: 1 } } // Only send safe metadata
+            { projection: { _id: 1, recipientPubKey: 1, sizeBytes: 1, createdAt: 1 } }
         ).toArray();
+        
+        const messagesGroup = await groupOfflineMessagesCollection.find(
+            { senderPubKey },
+            { projection: { _id: 1, recipientPubKey: 1, groupId: 1, sizeBytes: 1, createdAt: 1 } }
+        ).toArray();
+        // --- END MODIFIED ---
 
-        let currentUsage = 0;
-        messages.forEach(msg => { currentUsage += msg.sizeBytes; });
+        let currentUsage1on1 = 0;
+        const formattedMessages1on1 = messages1on1.map(msg => {
+            currentUsage1on1 += msg.sizeBytes;
+            return { ...msg, type: 'p2p' }; // Add type
+        });
+        
+        let currentUsageGroup = 0;
+        const formattedMessagesGroup = messagesGroup.map(msg => {
+            currentUsageGroup += msg.sizeBytes;
+            return { ...msg, type: 'group' }; // Add type
+        });
 
         res.json({
-            quotaUsed: currentUsage,
-            quotaLimit: USER_QUOTA_BYTES,
-            messages: messages
+            p2p: {
+                quotaUsed: currentUsage1on1,
+                quotaLimit: USER_QUOTA_BYTES,
+                messages: formattedMessages1on1
+            },
+            group: {
+                quotaUsed: currentUsageGroup,
+                quotaLimit: GROUP_QUOTA_BYTES,
+                messages: formattedMessagesGroup
+            }
         });
     } catch (err) {
         console.error("my-relayed-messages error:", err);
@@ -515,22 +557,32 @@ app.get("/my-relayed-messages/:senderPubKey", async (req, res) => {
 // Endpoint for sender to delete a message they relayed
 app.delete("/delete-relayed-message/:messageId", async (req, res) => {
     const { messageId } = req.params;
-    const { senderPubKey } = req.body; // Sender must prove ownership
-
+    // --- MODIFIED: Get 'type' from query to know which collection to use ---
+    const { senderPubKey } = req.body;
+    const { type } = req.query; // e.g., ?type=p2p or ?type=group
+    
     if (!senderPubKey) return res.status(400).json({ error: "Missing sender public key for auth." });
+    if (!type) return res.status(400).json({ error: "Missing 'type' query parameter." });
 
     try {
-        // Need to use MongoDB's ObjectId for lookup
-        const { ObjectId } = require("mongodb");
         const _id = new ObjectId(messageId);
+        let collectionToUse;
 
-        const deleteResult = await offlineMessagesCollection.deleteOne({
+        if (type === 'p2p') {
+            collectionToUse = offlineMessagesCollection;
+        } else if (type === 'group') {
+            collectionToUse = groupOfflineMessagesCollection;
+        } else {
+            return res.status(400).json({ error: "Invalid 'type' parameter." });
+        }
+
+        const deleteResult = await collectionToUse.deleteOne({
             _id: _id,
             senderPubKey: senderPubKey // CRITICAL: Ensure only the sender can delete
         });
 
         if (deleteResult.deletedCount === 1) {
-            console.log(`🗑️ Sender ${senderPubKey.slice(0,10)}... deleted relayed message ${messageId}`);
+            console.log(`🗑️ Sender ${senderPubKey.slice(0,10)}... deleted relayed ${type} message ${messageId}`);
             res.json({ success: true });
         } else {
             res.status(404).json({ error: "Message not found or you are not the owner." });
@@ -543,6 +595,76 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
 
 // --- END: Offline Message Relay Service ---
 
+/* =================================================================
+   3. NEW: Group Chat Service
+   ================================================================= */
+
+// --- NEW: Endpoint to create a group ---
+app.post("/group/create", async (req, res) => {
+    const { name, adminPubKey, members } = req.body; // members is an array of pubKeys
+    if (!name || !adminPubKey || !members || !Array.isArray(members) || members.length < 2) {
+        return res.status(400).json({ error: "Missing required fields or invalid members list." });
+    }
+    
+    // Ensure admin is in the members list
+    if (!members.includes(adminPubKey)) {
+        members.push(adminPubKey);
+    }
+
+    try {
+        const groupDoc = {
+            name,
+            adminPubKey,
+            members: members.map(key => ({ pubKey: key, joinedAt: new Date() })), // Store members as objects
+            createdAt: new Date(),
+        };
+        const result = await groupsCollection.insertOne(groupDoc);
+        const newGroupId = result.insertedId.toString();
+
+        console.log(`🏛️ Group created: ${name} (ID: ${newGroupId}) by ${adminPubKey.slice(0,10)}...`);
+        res.status(201).json({ success: true, groupId: newGroupId, group: groupDoc });
+    } catch (err) {
+        console.error("group/create error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
+// --- NEW: Endpoint to get all groups for a user ---
+app.get("/group/my-groups/:pubKey", async (req, res) => {
+    const { pubKey } = req.params;
+    if (!pubKey) return res.status(400).json({ error: "Missing public key." });
+
+    try {
+        const myGroups = await groupsCollection.find({ "members.pubKey": pubKey }).toArray();
+        res.json({ success: true, groups: myGroups });
+    } catch (err) {
+        console.error("group/my-groups error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
+// --- NEW: Endpoint to get group info (for key sharing) ---
+app.get("/group/info/:groupId", async (req, res) => {
+    const { groupId } = req.params;
+    const { myPubKey } = req.query; // For auth
+    
+    try {
+        const _id = new ObjectId(groupId);
+        const group = await groupsCollection.findOne({ _id });
+        
+        if (!group) return res.status(404).json({ error: "Group not found." });
+        
+        // Auth: Ensure the user asking is part of the group
+        if (!group.members.some(m => m.pubKey === myPubKey)) {
+            return res.status(403).json({ error: "You are not a member of this group." });
+        }
+
+        res.json({ success: true, group });
+    } catch (err) {
+        console.error("group/info error:", err);
+        res.status(500).json({ error: "Database operation failed or invalid ID." });
+    }
+});
 
 
 // --- END: Syrja ID Directory Service (v2) ---
@@ -601,7 +723,7 @@ io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
 
   // Handle client registration
-  socket.on("register", (pubKey) => {
+  socket.on("register", async (pubKey) => { // <-- Made async
     if (isRateLimited(socket)) {
       console.log(`⚠️ Rate limit exceeded for registration by ${socket.handshake.address}`);
       return;
@@ -614,7 +736,7 @@ io.on("connection", (socket) => {
 
     socket.emit('registered', { status: 'ok' });
     
-  // --- Notify subscribers that this user is now online ---
+    // --- Presence (Unchanged) ---
     const subscribers = presenceSubscriptions[key];
     if (subscribers && subscribers.length) {
       console.log(`📢 Notifying ${subscribers.length} subscribers that ${key.slice(0,12)}... is online.`);
@@ -623,9 +745,19 @@ io.on("connection", (socket) => {
       });
     }
     
-    // --- NEW: Check for offline relayed messages ---
-    
-// --- END NEW ---
+    // --- NEW: Auto-join group rooms ---
+    try {
+        const myGroups = await groupsCollection.find({ "members.pubKey": key }).toArray();
+        if (myGroups.length > 0) {
+            console.log(`🏛️ Client ${key.slice(0,10)}... is joining ${myGroups.length} group rooms.`);
+            myGroups.forEach(group => {
+                socket.join(group._id.toString());
+            });
+        }
+    } catch (err) {
+        console.error(`Error auto-joining group rooms for ${key.slice(0,10)}:`, err);
+    }
+    // --- END NEW ---
  });
   
     // --- NEW: Check for offline relayed messages ---
@@ -633,26 +765,32 @@ io.on("connection", (socket) => {
         // --- END NEW ---
   
   
-  // --- NEW: Handle client confirmation of message receipt ---
+  // --- MODIFIED: Handle client confirmation of message receipt ---
   socket.on("message-delivered", async (data) => {
-      if (!data || !data.id) return;
-      if (!socket.data.pubKey) return; // Client not registered
+      if (!data || !data.id || !data.type) return; // <-- Must have type
+      if (!socket.data.pubKey) return;
 
       try {
-          const { ObjectId } = require("mongodb");
           const _id = new ObjectId(data.id);
+          let collectionToUse;
 
-          // We must check that the client confirming delivery
-          // is the one the message was intended for.
-          const deleteResult = await offlineMessagesCollection.deleteOne({
+          if (data.type === 'p2p') {
+              collectionToUse = offlineMessagesCollection;
+          } else if (data.type === 'group') {
+              collectionToUse = groupOfflineMessagesCollection;
+          } else {
+              return console.warn(`⚠️ Invalid message-delivered type: ${data.type}`);
+          }
+
+          const deleteResult = await collectionToUse.deleteOne({
               _id: _id,
               recipientPubKey: socket.data.pubKey 
           });
 
           if (deleteResult.deletedCount === 1) {
-              console.log(`✅ Message ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted from server.`);
+              console.log(`✅ ${data.type} message ${data.id} delivered to ${socket.data.pubKey.slice(0,10)}... and deleted.`);
           } else {
-              console.warn(`⚠️ Message ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
+              console.warn(`⚠️ ${data.type} message ${data.id} delivery confirmation failed (not found, or wrong recipient).`);
           }
       } catch (err) {
            console.error(`Error deleting delivered message ${data.id}:`, err);
@@ -660,28 +798,112 @@ io.on("connection", (socket) => {
   });
 
     
-  // --- NEW: Client "pull" request for offline messages ---
+  // --- MODIFIED: Client "pull" request for offline messages ---
   socket.on("check-for-offline-messages", async () => {
       const key = socket.data.pubKey;
-      if (!key) return; // Client not registered
+      if (!key) return;
 
       try {
-          const messages = await offlineMessagesCollection.find({ recipientPubKey: key }).toArray();
-          if (messages.length > 0) {
-              console.log(`📬 Client ${key.slice(0,10)}... is pulling ${messages.length} relayed messages.`);
-              messages.forEach(msg => {
+          // 1. Get 1-on-1 Messages
+          const p2pMessages = await offlineMessagesCollection.find({ recipientPubKey: key }).toArray();
+          if (p2pMessages.length > 0) {
+              console.log(`📬 Client ${key.slice(0,10)}... is pulling ${p2pMessages.length} P2P messages.`);
+              p2pMessages.forEach(msg => {
                   socket.emit("offline-message", {
                       id: msg._id.toString(),
                       from: msg.senderPubKey,
                       payload: msg.encryptedPayload,
-                      sentAt: msg.createdAt
+                      sentAt: msg.createdAt,
+                      type: 'p2p' // <-- Add type
                   });
               });
-          } else {
+          }
+          
+          // 2. Get Group Messages
+          const groupMessages = await groupOfflineMessagesCollection.find({ recipientPubKey: key }).toArray();
+          if (groupMessages.length > 0) {
+              console.log(`📬 Client ${key.slice(0,10)}... is pulling ${groupMessages.length} GROUP messages.`);
+              groupMessages.forEach(msg => {
+                  socket.emit("offline-message", {
+                      id: msg._id.toString(),
+                      from: msg.senderPubKey, // Sender
+                      groupId: msg.groupId, // <-- NEW
+                      payload: msg.encryptedPayload,
+                      sentAt: msg.createdAt,
+                      type: 'group' // <-- Add type
+                  });
+              });
+          }
+
+          if (p2pMessages.length === 0 && groupMessages.length === 0) {
                console.log(`📬 Client ${key.slice(0,10)}... pulled messages, 0 found.`);
           }
       } catch (err) {
           console.error(`Error fetching offline messages for ${key.slice(0,10)}:`, err);
+      }
+  });
+
+  // --- NEW: Handle Group Message Sending ---
+  socket.on("send-group-message", async (data) => {
+      const { groupId, senderPubKey, encryptedPayload, sizeBytes } = data;
+      if (!groupId || !senderPubKey || !encryptedPayload || !sizeBytes) {
+          return console.warn("⚠️ Received invalid 'send-group-message' packet.");
+      }
+
+      const key = socket.data.pubKey;
+      if (key !== senderPubKey) {
+          return console.warn(`⚠️ Socket ID ${socket.id} spoofing senderPubKey ${senderPubKey}!`);
+      }
+
+      try {
+          // 1. Auth: Check if sender is in the group
+          const _id = new ObjectId(groupId);
+          const group = await groupsCollection.findOne({ _id });
+          if (!group || !group.members.some(m => m.pubKey === senderPubKey)) {
+              return console.warn(`⚠️ User ${senderPubKey.slice(0,10)}... NOT in group ${groupId}.`);
+          }
+          
+          // 2. Check group quota
+          const userMessagesGroup = await groupOfflineMessagesCollection.find({ senderPubKey }).toArray();
+          let currentUsageGroup = 0;
+          userMessagesGroup.forEach(msg => { currentUsageGroup += msg.sizeBytes; });
+          
+          if (currentUsageGroup + sizeBytes > GROUP_QUOTA_BYTES) {
+              console.warn(`⚠️ Group quota exceeded for ${senderPubKey.slice(0,10)}...`);
+              // TODO: Emit an error back to the sender?
+              return;
+          }
+
+          // 3. Fan out to ONLINE members (including sender for sync)
+          // We send the full packet so clients can identify the sender
+          const onlineMembers = group.members
+              .filter(m => userSockets[m.pubKey]) // Find who is online
+              .map(m => userSockets[m.pubKey]);   // Get their socket IDs
+          
+          console.log(`🏛️ Relaying group message from ${senderPubKey.slice(0,10)}... to ${onlineMembers.length} online members.`);
+          onlineMembers.forEach(socketId => {
+              io.to(socketId).emit("receive-group-message", {
+                  groupId,
+                  senderPubKey,
+                  encryptedPayload
+              });
+          });
+
+          // 4. Store for OFFLINE members
+          const offlineMembers = group.members.filter(m => !userSockets[m.pubKey]);
+          if (offlineMembers.length > 0) {
+              console.log(`   ...and storing for ${offlineMembers.length} offline members.`);
+              const messageDocs = offlineMembers.map(member => ({
+                  groupId, senderPubKey, encryptedPayload, sizeBytes,
+                  recipientPubKey: member.pubKey,
+                  createdAt: new Date(),
+                  expireAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000)
+              }));
+              await groupOfflineMessagesCollection.insertMany(messageDocs);
+          }
+
+      } catch (err) {
+          console.error(`Error handling send-group-message for ${groupId}:`, err);
       }
   });
   // Handle presence subscription
