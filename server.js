@@ -677,6 +677,52 @@ app.get("/group/info/:groupId", async (req, res) => {
     }
 });
 
+// --- NEW: Endpoint for a user to leave a group ---
+app.post("/group/leave", async (req, res) => {
+    const { groupId, pubKey } = req.body;
+    if (!groupId || !pubKey) {
+        return res.status(400).json({ error: "Missing groupId or pubKey." });
+    }
+
+    try {
+        const _id = new ObjectId(groupId);
+        const normalizedPubKey = normalizeB64(pubKey);
+        
+        // 1. Pull the member from the group's member list
+        const updateResult = await groupsCollection.updateOne(
+            { _id },
+            { $pull: { members: { pubKey: normalizedPubKey } } }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+            console.warn(`⚠️ User ${normalizedPubKey.slice(0,10)}... tried to leave group ${groupId}, but was not found or not a member.`);
+            // We can still proceed to delete messages, just in case
+        }
+
+        // 2. Delete all pending offline messages for this user *from* this group
+        // (i.e., messages sent by others *to* this user)
+        const msgDeleteResult = await groupOfflineMessagesCollection.deleteMany({
+            groupId: groupId,
+            recipientPubKey: normalizedPubKey
+        });
+
+        console.log(`🏛️ User ${normalizedPubKey.slice(0,10)}... left group ${groupId}. Removed from ${updateResult.modifiedCount} group docs. Deleted ${msgDeleteResult.deletedCount} pending messages.`);
+
+        // 3. Notify all other *online* members in the group room
+        // The client-side will handle updating their local storage
+        io.to(groupId).emit("member-left", {
+            groupId: groupId,
+            pubKey: normalizedPubKey
+        });
+        
+        res.json({ success: true, message: "Successfully left group." });
+
+    } catch (err) {
+        console.error("group/leave error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
 
 // --- END: Syrja ID Directory Service (v2) ---
 // --- START: Simple Rate Limiting ---
