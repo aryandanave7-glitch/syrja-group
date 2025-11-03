@@ -791,6 +791,74 @@ app.post("/group/remove-member", async (req, res) => {
     }
 });
 
+// --- NEW: Endpoint for ANY member to update group info (avatar, etc.) ---
+app.post("/group/update-info", async (req, res) => {
+    // We only support avatar for now, but this is built to support name/desc later
+    const { groupId, pubKey, avatar } = req.body;
+
+    if (!groupId || !pubKey) {
+        return res.status(400).json({ error: "Missing groupId or pubKey." });
+    }
+
+    try {
+        const _id = new ObjectId(groupId);
+        const normalizedPubKey = normalizeB64(pubKey);
+
+        // 1. Get the group and VERIFY membership
+        const group = await groupsCollection.findOne({ _id });
+        if (!group) {
+            return res.status(404).json({ error: "Group not found." });
+        }
+        if (!group.members.some(m => m.pubKey === normalizedPubKey)) {
+            return res.status(403).json({ error: "You are not a member of this group." });
+        }
+
+        // 2. Build the update document
+        const fieldsToUpdate = {};
+        if (avatar) fieldsToUpdate.avatar = avatar;
+        // if (name) fieldsToUpdate.name = name; // <-- Ready for when you want to add this
+        // if (description) fieldsToUpdate.description = description; // <-- Ready for when you want to add this
+
+        if (Object.keys(fieldsToUpdate).length === 0) {
+            return res.status(400).json({ error: "No update fields provided." });
+        }
+
+        // 3. Update the document in MongoDB
+        const updateResult = await groupsCollection.updateOne(
+            { _id },
+            { $set: fieldsToUpdate }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+            return res.status(304).json({ message: "No changes detected." });
+        }
+
+        console.log(`🏛️ Group info updated for ${groupId} by ${normalizedPubKey.slice(0,10)}...`);
+
+        // 4. Broadcast the 'group-updated' event to force all clients to re-sync
+        io.to(groupId).emit("group-updated", {
+            groupId: groupId,
+            changedByPubKey: normalizedPubKey
+        });
+
+        // 5. Broadcast the 'group-log' event for the chat message
+        if (avatar) {
+            io.to(groupId).emit("group-log", {
+                groupId: groupId,
+                changedByPubKey: normalizedPubKey,
+                changed: "avatar", // Send *what* changed
+                ts: Date.now()
+            });
+        }
+        
+        res.json({ success: true, message: "Group updated." });
+
+    } catch (err) {
+        console.error("group/update-info error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
 
 // --- END: Syrja ID Directory Service (v2) ---
 // --- START: Simple Rate Limiting ---
