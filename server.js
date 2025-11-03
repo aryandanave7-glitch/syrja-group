@@ -1,3 +1,12 @@
+// server.js
+// Helper to normalize keys
+function normalizeB64(s){
+  if(!s) return s;
+  let r = s.replace(/\s+/g,''); // remove all whitespace
+  const mod = r.length % 4;
+  if(mod > 0) r += '='.repeat(4 - mod);
+  return r;
+}
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -615,7 +624,7 @@ app.post("/group/create", async (req, res) => {
         const groupDoc = {
             name,
             adminPubKey,
-            members: members.map(key => ({ pubKey: key, joinedAt: new Date() })), // Store members as objects
+            members: members.map(key => ({ pubKey: normalizeB64(key), joinedAt: new Date() })), // <-- MODIFIED
             createdAt: new Date(),
         };
         const result = await groupsCollection.insertOne(groupDoc);
@@ -646,7 +655,7 @@ app.get("/group/my-groups/:pubKey", async (req, res) => {
 // --- NEW: Endpoint to get group info (for key sharing) ---
 app.get("/group/info/:groupId", async (req, res) => {
     const { groupId } = req.params;
-    const { myPubKey } = req.query; // For auth
+    const myPubKey = normalizeB64(req.query.myPubKey);
     
     try {
         const _id = new ObjectId(groupId);
