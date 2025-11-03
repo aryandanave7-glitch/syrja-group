@@ -723,6 +723,74 @@ app.post("/group/leave", async (req, res) => {
     }
 });
 
+// --- NEW: Endpoint for an admin to remove a member ---
+app.post("/group/remove-member", async (req, res) => {
+    const { groupId, adminPubKey, memberToRemovePubKey } = req.body;
+    if (!groupId || !adminPubKey || !memberToRemovePubKey) {
+        return res.status(400).json({ error: "Missing required fields." });
+    }
+    
+    // Prevent admin from removing themselves
+    if (adminPubKey === memberToRemovePubKey) {
+        return res.status(400).json({ error: "Admin cannot remove themselves." });
+    }
+
+    try {
+        const _id = new ObjectId(groupId);
+        const normalizedAdminKey = normalizeB64(adminPubKey);
+        const normalizedMemberKey = normalizeB64(memberToRemovePubKey);
+
+        // 1. Get the group and VERIFY admin status
+        const group = await groupsCollection.findOne({ _id });
+        if (!group) {
+            return res.status(404).json({ error: "Group not found." });
+        }
+        if (group.adminPubKey !== normalizedAdminKey) {
+            return res.status(403).json({ error: "You are not the admin of this group." });
+        }
+
+        // 2. Pull the member from the group's member list
+        const updateResult = await groupsCollection.updateOne(
+            { _id },
+            { $pull: { members: { pubKey: normalizedMemberKey } } }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+            // This just means they weren't in the list, which is fine.
+            console.warn(`⚠️ Admin ${normalizedAdminKey.slice(0,10)}... tried to remove ${normalizedMemberKey.slice(0,10)}... from ${groupId}, but they weren't a member.`);
+        }
+
+        // 3. Delete pending offline messages for the removed member
+        const msgDeleteResult = await groupOfflineMessagesCollection.deleteMany({
+            groupId: groupId,
+            recipientPubKey: normalizedMemberKey
+        });
+
+        console.log(`🏛️ Admin ${normalizedAdminKey.slice(0,10)}... removed ${normalizedMemberKey.slice(0,10)}... from group ${groupId}. Deleted ${msgDeleteResult.deletedCount} pending messages.`);
+
+        // 4. Notify all members (including the one being kicked) that they are gone
+        io.to(groupId).emit("member-left", {
+            groupId: groupId,
+            pubKey: normalizedMemberKey
+        });
+        
+        // 5. NEW: Send the in-chat log message (as requested)
+        // We send the PubKeys; the client will resolve them to names
+        io.to(groupId).emit("group-log", {
+            groupId: groupId,
+            adminPubKey: normalizedAdminKey,
+            removedPubKey: normalizedMemberKey,
+            ts: Date.now()
+        });
+        
+        res.json({ success: true, message: "Member removed." });
+
+    } catch (err) {
+        console.error("group/remove-member error:", err);
+        res.status(500).json({ error: "Database operation failed." });
+    }
+});
+
 
 // --- END: Syrja ID Directory Service (v2) ---
 // --- START: Simple Rate Limiting ---
