@@ -610,7 +610,7 @@ app.delete("/delete-relayed-message/:messageId", async (req, res) => {
 
 // --- NEW: Endpoint to create a group ---
 app.post("/group/create", async (req, res) => {
-    const { name, description, adminPubKey, members } = req.body; // members is an array of pubKeys
+    const { name, description,avatar, adminPubKey, members } = req.body; // members is an array of pubKeys
     if (!name || !adminPubKey || !members || !Array.isArray(members) || members.length < 2) {
         return res.status(400).json({ error: "Missing required fields or invalid members list." });
     }
@@ -624,6 +624,7 @@ app.post("/group/create", async (req, res) => {
         const groupDoc = {
             name,
             description: description || null, // Add the description (or null if not provided)
+            avatar: avatar || null, // Save the base64 Data URL (or null)
             adminPubKey,
             members: members.map(key => ({ pubKey: normalizeB64(key), joinedAt: new Date() })), // <-- MODIFIED
             createdAt: new Date(),
