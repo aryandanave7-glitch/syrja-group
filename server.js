@@ -792,9 +792,10 @@ app.post("/group/remove-member", async (req, res) => {
 });
 
 // --- NEW: Endpoint for ANY member to update group info (avatar, etc.) ---
+// --- MODIFIED: Endpoint for ANY member to update group info (avatar, name, desc) ---
 app.post("/group/update-info", async (req, res) => {
-    // We only support avatar for now, but this is built to support name/desc later
-    const { groupId, pubKey, avatar } = req.body;
+    // NOW supports avatar, name, AND description
+    const { groupId, pubKey, avatar, name, description } = req.body;
 
     if (!groupId || !pubKey) {
         return res.status(400).json({ error: "Missing groupId or pubKey." });
@@ -815,9 +816,22 @@ app.post("/group/update-info", async (req, res) => {
 
         // 2. Build the update document
         const fieldsToUpdate = {};
-        if (avatar) fieldsToUpdate.avatar = avatar;
-        // if (name) fieldsToUpdate.name = name; // <-- Ready for when you want to add this
-        // if (description) fieldsToUpdate.description = description; // <-- Ready for when you want to add this
+        let logPayload = null; // For the chat log
+
+        if (avatar) {
+            fieldsToUpdate.avatar = avatar;
+            logPayload = { changed: "avatar" };
+        }
+        // Check if name is provided (and not just an empty string)
+        if (name) {
+            fieldsToUpdate.name = name;
+            logPayload = { changed: "name", newValue: name };
+        }
+        // Check if description is provided (even an empty string is a valid update)
+        if (description !== undefined) {
+            fieldsToUpdate.description = description;
+            logPayload = { changed: "description" };
+        }
 
         if (Object.keys(fieldsToUpdate).length === 0) {
             return res.status(400).json({ error: "No update fields provided." });
@@ -830,6 +844,7 @@ app.post("/group/update-info", async (req, res) => {
         );
 
         if (updateResult.modifiedCount === 0) {
+            // This can happen if the user "saves" the same name again
             return res.status(304).json({ message: "No changes detected." });
         }
 
@@ -842,11 +857,11 @@ app.post("/group/update-info", async (req, res) => {
         });
 
         // 5. Broadcast the 'group-log' event for the chat message
-        if (avatar) {
+        if (logPayload) {
             io.to(groupId).emit("group-log", {
                 groupId: groupId,
                 changedByPubKey: normalizedPubKey,
-                changed: "avatar", // Send *what* changed
+                ...logPayload, // Spread the log payload (e.g., changed: "name", newValue: "...")
                 ts: Date.now()
             });
         }
