@@ -621,29 +621,13 @@ app.post("/group/create", async (req, res) => {
     }
 
     try {
-        // NEW: Map members to the new Role-Based Schema
-        const memberObjects = members.map(key => {
-            const normalizedKey = normalizeB64(key);
-            return {
-                pubKey: normalizedKey,
-                joinedAt: new Date(),
-                // Set 'admin' role for the creator, 'member' for everyone else
-                role: (normalizedKey === adminPubKey) ? 'admin' : 'member'
-            };
-        });
-
         const groupDoc = {
             name,
-            description: description || null,
-            avatar: avatar || null, 
-            adminPubKey, // Keep this for easy admin lookup
-            members: memberObjects, // Use the new objects
+            description: description || null, // Add the description (or null if not provided)
+            avatar: avatar || null, // Save the base64 Data URL (or null)
+            adminPubKey,
+            members: members.map(key => ({ pubKey: normalizeB64(key), joinedAt: new Date() })), // <-- MODIFIED
             createdAt: new Date(),
-            // NEW: Add default group settings
-            settings: {
-                who_can_edit_info: "all_members", // "all_members" or "admins_only"
-                who_can_remove_members: "admins_only" // "all_members" or "admins_only"
-            }
         };
         const result = await groupsCollection.insertOne(groupDoc);
         const newGroupId = result.insertedId.toString();
@@ -757,27 +741,13 @@ app.post("/group/remove-member", async (req, res) => {
         const normalizedMemberKey = normalizeB64(memberToRemovePubKey);
 
         // 1. Get the group and VERIFY admin status
-        // 1. Get the group and VERIFY admin/moderator status
         const group = await groupsCollection.findOne({ _id });
         if (!group) {
             return res.status(404).json({ error: "Group not found." });
         }
-        
-        const adminMember = group.members.find(m => m.pubKey === normalizedAdminKey);
-        if (!adminMember) {
-            return res.status(403).json({ error: "You are not a member of this group." });
+        if (group.adminPubKey !== normalizedAdminKey) {
+            return res.status(403).json({ error: "You are not the admin of this group." });
         }
-
-        // --- NEW PERMISSION CHECK ---
-        // Check both the group-level setting AND the user's role
-        const canRemove = group.settings.who_can_remove_members === "all_members" ||
-                          adminMember.role === "admin" ||
-                          adminMember.role === "moderator";
-
-        if (!canRemove) {
-            return res.status(403).json({ error: "You do not have permission to remove members." });
-        }
-        // --- END PERMISSION CHECK ---
 
         // 2. Pull the member from the group's member list
         const updateResult = await groupsCollection.updateOne(
@@ -822,7 +792,7 @@ app.post("/group/remove-member", async (req, res) => {
 });
 
 // --- NEW: Endpoint for ANY member to update group info (avatar, etc.) ---
-// ...
+// --- MODIFIED: Endpoint for ANY member to update group info (avatar, name, desc) ---
 app.post("/group/update-info", async (req, res) => {
     // NOW supports avatar, name, AND description
     const { groupId, pubKey, avatar, name, description } = req.body;
@@ -833,29 +803,17 @@ app.post("/group/update-info", async (req, res) => {
 
     try {
         const _id = new ObjectId(groupId);
-        
+        const normalizedPubKey = normalizeB64(pubKey);
+
         // 1. Get the group and VERIFY membership
         const group = await groupsCollection.findOne({ _id });
         if (!group) {
             return res.status(404).json({ error: "Group not found." });
         }
-        
-        const normalizedPubKey = normalizeB64(pubKey);
-        const member = group.members.find(m => m.pubKey === normalizedPubKey);
-
-        if (!member) {
+        if (!group.members.some(m => m.pubKey === normalizedPubKey)) {
             return res.status(403).json({ error: "You are not a member of this group." });
         }
 
-        // --- NEW PERMISSION CHECK ---
-        const canEdit = group.settings.who_can_edit_info === "all_members" ||
-                        member.role === "admin" ||
-                        member.role === "moderator";
-                        
-        if (!canEdit) {
-            return res.status(403).json({ error: "You do not have permission to edit this group's info." });
-        }
-        // --- END PERMISSION CHECK ---
         // 2. Build the update document
         const fieldsToUpdate = {};
         let logPayload = null; // For the chat log
@@ -912,147 +870,6 @@ app.post("/group/update-info", async (req, res) => {
 
     } catch (err) {
         console.error("group/update-info error:", err);
-        res.status(500).json({ error: "Database operation failed." });
-    }
-});
-
-// --- NEW: Endpoint for an ADMIN to promote/demote a member ---
-app.post("/group/promote-member", async (req, res) => {
-    const { groupId, adminPubKey, targetMemberPubKey, newRole } = req.body;
-
-    if (!groupId || !adminPubKey || !targetMemberPubKey || !newRole) {
-        return res.status(400).json({ error: "Missing required fields." });
-    }
-    if (newRole !== "moderator" && newRole !== "member") {
-        return res.status(400).json({ error: "Invalid role. Must be 'moderator' or 'member'." });
-    }
-
-    try {
-        const _id = new ObjectId(groupId);
-        const normalizedAdminKey = normalizeB64(adminPubKey);
-        const normalizedTargetKey = normalizeB64(targetMemberPubKey);
-        
-        // 1. Get group and VERIFY SENDER IS ADMIN (Only Admin can promote)
-        const group = await groupsCollection.findOne({ _id });
-        if (!group) {
-            return res.status(404).json({ error: "Group not found." });
-        }
-        const adminMember = group.members.find(m => m.pubKey === normalizedAdminKey);
-        if (!adminMember || adminMember.role !== "admin") {
-            return res.status(403).json({ error: "Only the group Admin can change roles." });
-        }
-
-        // 2. Update the target member's role
-        const updateResult = await groupsCollection.updateOne(
-            { _id, "members.pubKey": normalizedTargetKey },
-            { $set: { "members.$.role": newRole } }
-        );
-        
-        if (updateResult.modifiedCount === 0) {
-            return res.status(404).json({ error: "Member not found in group." });
-        }
-
-        console.log(`🏛️ Admin ${normalizedAdminKey.slice(0,10)}... set ${normalizedTargetKey.slice(0,10)}... to role '${newRole}' in group ${groupId}.`);
-
-        // 3. Broadcast to all members that a role changed
-        io.to(groupId).emit("member-role-changed", {
-            groupId,
-            pubKey: normalizedTargetKey,
-            newRole: newRole
-        });
-        
-        // 4. Broadcast the log message
-        io.to(groupId).emit("group-log", {
-            groupId,
-            adminPubKey: normalizedAdminKey,
-            promotedPubKey: normalizedTargetKey,
-            newRole: newRole,
-            ts: Date.now()
-        });
-        
-        res.json({ success: true, message: "Member role updated." });
-
-    } catch (err) {
-        console.error("group/promote-member error:", err);
-        res.status(500).json({ error: "Database operation failed." });
-    }
-});
-
-// --- NEW: Endpoint for an ADMIN to change group settings ---
-app.post("/group/update-settings", async (req, res) => {
-    const { groupId, adminPubKey, newSettings } = req.body;
-    if (!groupId || !adminPubKey || !newSettings) {
-        return res.status(400).json({ error: "Missing required fields." });
-    }
-
-    try {
-        const _id = new ObjectId(groupId);
-        const normalizedAdminKey = normalizeB64(adminPubKey);
-
-        // 1. Get group and VERIFY SENDER IS ADMIN
-        const group = await groupsCollection.findOne({ _id });
-        if (!group) {
-            return res.status(404).json({ error: "Group not found." });
-        }
-        const adminMember = group.members.find(m => m.pubKey === normalizedAdminKey);
-        if (!adminMember || adminMember.role !== "admin") {
-            return res.status(403).json({ error: "Only the group Admin can change settings." });
-        }
-        
-        // 2. Validate and build the update object (e.g., "settings.who_can_edit_info")
-        const fieldsToUpdate = {};
-        let logPayload = null;
-        if (newSettings.who_can_edit_info) {
-            const val = newSettings.who_can_edit_info;
-            if (val === "all_members" || val === "admins_only") {
-                fieldsToUpdate["settings.who_can_edit_info"] = val;
-                logPayload = { changed: "setting_edit", newValue: val };
-            }
-        }
-        if (newSettings.who_can_remove_members) {
-            const val = newSettings.who_can_remove_members;
-            if (val === "all_members" || val === "admins_only") {
-                fieldsToUpdate["settings.who_can_remove_members"] = val;
-                logPayload = { changed: "setting_remove", newValue: val };
-            }
-        }
-        
-        if (Object.keys(fieldsToUpdate).length === 0) {
-            return res.status(400).json({ error: "No valid settings provided." });
-        }
-
-        // 3. Update the settings in MongoDB
-        const updateResult = await groupsCollection.updateOne(
-            { _id },
-            { $set: fieldsToUpdate }
-        );
-        
-        if (updateResult.modifiedCount === 0) {
-            return res.status(304).json({ message: "Settings already up-to-date." });
-        }
-
-        console.log(`🏛️ Admin ${normalizedAdminKey.slice(0,10)}... updated settings for group ${groupId}.`);
-
-        // 4. Broadcast to all members that settings changed
-        io.to(groupId).emit("group-settings-changed", {
-            groupId,
-            newSettings: fieldsToUpdate // Send the fields that changed
-        });
-
-        // 5. Broadcast log message
-        if (logPayload) {
-            io.to(groupId).emit("group-log", {
-                groupId,
-                adminPubKey: normalizedAdminKey,
-                ...logPayload,
-                ts: Date.now()
-            });
-        }
-        
-        res.json({ success: true, message: "Group settings updated." });
-
-    } catch (err) {
-        console.error("group/update-settings error:", err);
         res.status(500).json({ error: "Database operation failed." });
     }
 });
